@@ -3,6 +3,12 @@ ftbrony
 
 FTP Server for 3DS.
 
+
+Modifications from original
+---------------------------
+- Ponys have been removed/replaced
+- Building also cia now
+
 Features
 --------
 - Appears to work well with a variety of clients.
