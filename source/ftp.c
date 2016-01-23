@@ -1,7 +1,3 @@
-/* This is FTP server implementation is based on RFC 959
- * (https://tools.ietf.org/html/rfc959) and suggested implementation details
- * from https://cr.yp.to/ftp/filesystem.html
- */
 #include "ftp.h"
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -57,7 +53,6 @@ FTP_DECLARE(DELE);
 FTP_DECLARE(FEAT);
 FTP_DECLARE(HELP);
 FTP_DECLARE(LIST);
-FTP_DECLARE(MDTM);
 FTP_DECLARE(MKD);
 FTP_DECLARE(MODE);
 FTP_DECLARE(NLST);
@@ -119,7 +114,6 @@ struct ftp_session_t
   int                cmd_fd;    /*!< socket for command connection */
   int                pasv_fd;   /*!< listen socket for PASV */
   int                data_fd;   /*!< socket for data transfer */
-  time_t             timestamp; /*!< time from last command */
   session_flags_t    flags;     /*!< session flags */
   session_state_t    state;     /*!< session state */
   ftp_session_t      *next;     /*!< link to next session */
@@ -162,7 +156,6 @@ static ftp_command_t ftp_commands[] =
   FTP_COMMAND(FEAT),
   FTP_COMMAND(HELP),
   FTP_COMMAND(LIST),
-  FTP_COMMAND(MDTM),
   FTP_COMMAND(MKD),
   FTP_COMMAND(MODE),
   FTP_COMMAND(NLST),
@@ -666,36 +659,42 @@ ftp_session_transfer(ftp_session_t *session)
   } while(rc == 0);
 }
 
-/*! encode a path
+/*! escape a buffer
  *
- *  @param[in]     path   path to encode
- *  @param[in,out] len    path length
- *  @param[in]     quotes whether to encode quotes
+ *  @param[in]     buffer buffer to escape
+ *  @param[in,out] len    buffer length
+ *  @param[in]     quotes whether to escape quotes
  *
- *  @returns encoded path
+ *  @returns escaped buffer
  *
- *  @note The caller must free the returned path
+ *  @note The caller must free the returned buffer
  */
 static char*
-encode_path(const char *path,
-            size_t     *len,
-            bool       quotes)
+escape_buffer(const char *buffer,
+              size_t     *len,
+              bool       quotes)
 {
-  bool   enc = false;
   size_t i, diff = 0;
-  char   *out, *p = (char*)path;
+  char   *out, *p = (char*)buffer;
 
-  /* check for \n that needs to be encoded */
-  if(memchr(p, '\n', *len) != NULL)
-    enc = true;
+  /* check for \r that needs to be escaped */
+  do
+  {
+    p = memchr(p, '\r', buffer + *len - p);
+    if(p != NULL)
+    {
+      ++p;
+      ++diff;
+    }
+  } while(p != NULL);
 
   if(quotes)
   {
-    /* check for " that needs to be encoded */
-    p = (char*)path;
+    /* check for " that needs to be escaped */
+    p = (char*)buffer;
     do
     {
-      p = memchr(p, '"', path + *len - p);
+      p = memchr(p, '"', buffer + *len - p);
       if(p != NULL)
       {
         ++p;
@@ -704,69 +703,36 @@ encode_path(const char *path,
     } while(p != NULL);
   }
 
-  /* check if an encode was needed */
-  if(!enc && diff == 0)
-    return strdup(path);
+  /* check if an escape was needed */
+  if(diff == 0)
+    return strdup(buffer);
 
-  /* allocate space for encoded path */
+  /* escape \r */
   p = out = (char*)malloc(*len + diff);
   if(out == NULL)
     return NULL;
 
-  /* copy the path while performing encoding */
+  /* copy the buffer while performing escapes */
   for(i = 0; i < *len; ++i)
   {
-    if(*path == '\n')
+    if(*buffer == '\r')
     {
-      /* encoded \n is \0 */
+      /* escaped \r is \r\0 */
+      *p++ = *buffer++;
       *p++ = 0;
     }
-    else if(quotes && *path == '"')
+    else if(quotes && *buffer == '"')
     {
-      /* encoded " is "" */
-      *p++ = '"';
+      /* escaped " is "" */
+      *p++ = *buffer++;
       *p++ = '"';
     }
     else
-      *p++ = *path;
-    ++path;
+      *p++ = *buffer++;
   }
 
   *len += diff;
   return out;
-}
-
-/*! decode a path
- *
- *  @param[in] session ftp session
- */
-static void
-decode_path(ftp_session_t *session)
-{
-  size_t in, out;
-  size_t diff = 0;
-
-  /* decode \0 from the first command */
-  for(in = out = 0; in < session->cmd_buffersize && session->cmd_buffer[in] != 0; ++in)
-  {
-    if(session->cmd_buffer[in] == 0)
-    {
-      /* this is an encoded \r */
-      session->cmd_buffer[out++] = session->cmd_buffer[in++];
-      ++diff;
-    }
-    else
-    {
-      session->cmd_buffer[out++] = session->cmd_buffer[in];
-    }
-  }
-
-  /* copy remaining buffer */
-  if(diff > 0)
-    memmove(session->cmd_buffer + out, session->cmd_buffer + in, session->cmd_buffersize - in);
-
-  /* adjust the buffer size */
-  session->cmd_buffersize -= diff;
 }
 
 /*! send a response on the command socket
@@ -1071,6 +1037,41 @@ ftp_session_connect(ftp_session_t *session)
   return 0;
 }
 
+/*! unescape a command
+ *
+ *  @param[in] session ftp session
+ */
+static void
+ftp_session_unescape_command(ftp_session_t *session)
+{
+  size_t in, out;
+  size_t diff = 0;
+
+  /* escape \r\0 from the first command */
+  for(in = out = 0; in < session->cmd_buffersize && session->cmd_buffer[in] != 0; ++in)
+  {
+    if(session->cmd_buffer[in] == '\r'
+    && in < session->cmd_buffersize - 1
+    && session->cmd_buffer[in+1] == 0)
+    {
+      /* this is an escaped \r */
+      session->cmd_buffer[out++] = session->cmd_buffer[in++];
+      ++diff;
+    }
+    else
+    {
+      session->cmd_buffer[out++] = session->cmd_buffer[in];
+    }
+  }
+
+  /* copy remaining buffer */
+  if(diff > 0)
+    memmove(session->cmd_buffer + out, session->cmd_buffer + in, session->cmd_buffersize - in);
+
+  /* adjust the buffer size */
+  session->cmd_buffersize -= diff;
+}
+
 /*! read command for ftp session
  *
  *  @param[in] session ftp session
@@ -1184,36 +1185,28 @@ ftp_session_read_command(ftp_session_t *session,
     while(true)
     {
       /* must have at least enough data for the delimiter */
-      if(session->cmd_buffersize < 1)
+      if(session->cmd_buffersize < 2)
         return;
 
-      /* look for \r\n or \n delimiter */
-      for(i = 0; i < session->cmd_buffersize; ++i)
+      /* look for \r\n delimiter */
+      for(i = 0; i < session->cmd_buffersize-1; ++i)
       {
-        if(i < session->cmd_buffersize-1
-        && session->cmd_buffer[i]   == '\r'
+        if(session->cmd_buffer[i]   == '\r'
         && session->cmd_buffer[i+1] == '\n')
         {
-          /* we found a \r\n delimiter */
+          /* we found a delimiter */
           session->cmd_buffer[i] = 0;
           next = &session->cmd_buffer[i+2];
-          break;
-        }
-        else if(session->cmd_buffer[i] == '\n')
-        {
-          /* we found a \n delimiter */
-          session->cmd_buffer[i] = 0;
-          next = &session->cmd_buffer[i+1];
           break;
         }
       }
 
       /* check if a delimiter was found */
-      if(i == session->cmd_buffersize)
+      if(i == session->cmd_buffersize-1)
         return;
 
-      /* decode the command */
-      decode_path(session);
+      /* unescape the command */
+      ftp_session_unescape_command(session);
 
       /* split command from arguments */
       args = buffer = session->cmd_buffer;
@@ -1227,9 +1220,6 @@ ftp_session_read_command(ftp_session_t *session,
       command = bsearch(&key, ftp_commands,
                         num_ftp_commands, sizeof(ftp_command_t),
                         ftp_command_cmp);
-
-      /* update command timestamp */
-      session->timestamp = time(NULL);
 
       /* execute the command */
       if(command == NULL)
@@ -1779,9 +1769,6 @@ list_transfer(ftp_session_t *session)
 {
   ssize_t       rc;
   size_t        len;
-  uint64_t      mtime;
-  time_t        t_mtime;
-  struct tm     *tm;
   char          *buffer;
   struct stat   st;
   struct dirent *dent;
@@ -1825,9 +1812,9 @@ list_transfer(ftp_session_t *session)
       session->buffersize = 0;
       if(build_path(session, session->lwd, dent->d_name) == 0)
       {
-        /* encode \n in path */
+        /* escape \r as per telnet standard */
         len = strlen(session->buffer);
-        buffer = encode_path(session->buffer, &len, false);
+        buffer = escape_buffer(session->buffer, &len, false);
         if(buffer != NULL)
         {
           /* copy to the session buffer to send */
@@ -1851,14 +1838,6 @@ list_transfer(ftp_session_t *session)
         st.st_mode = S_IFREG;
 
       st.st_size = dir->entry_data.fileSize;
-
-      if((rc = build_path(session, session->lwd, dent->d_name)) != 0)
-        console_print(RED "build_path: %d %s\n" RESET, errno, strerror(errno));
-      else if((rc = sdmc_getmtime(session->buffer, &mtime)) != 0)
-      {
-        console_print(RED "sdmc_getmtime '%s': 0x%x\n" RESET, session->buffer, rc);
-        mtime = 0;
-      }
 #else
       /* lstat the entry */
       if((rc = build_path(session, session->lwd, dent->d_name)) != 0)
@@ -1873,40 +1852,20 @@ list_transfer(ftp_session_t *session)
         ftp_send_response(session, 550, "unavailable\r\n");
         return LOOP_EXIT;
       }
-
-      mtime = st.st_mtime;
 #endif
-      /* encode \n in path */
+
+      /* escape \r as per telnet standard */
       len = strlen(dent->d_name);
-      buffer = encode_path(dent->d_name, &len, false);
+      buffer = escape_buffer(dent->d_name, &len, false);
       if(buffer != NULL)
       {
         /* copy to the session buffer to send */
         session->buffersize =
             sprintf(session->buffer,
-                    "%crwxrwxrwx 1 3DS 3DS %llu ",
+                    "%crwxrwxrwx 1 3DS 3DS %llu Jan 1 1970 ",
                     S_ISDIR(st.st_mode) ? 'd' :
                     S_ISLNK(st.st_mode) ? 'l' : '-',
                     (unsigned long long)st.st_size);
-
-        t_mtime = mtime;
-        tm = gmtime(&t_mtime);
-        if(tm != NULL)
-        {
-          const char *fmt = "%b %e %Y ";
-          if(session->timestamp > mtime && session->timestamp - mtime < (60*60*24*365/2))
-            fmt = "%b %e %H:%M ";
-          session->buffersize +=
-              strftime(session->buffer + session->buffersize,
-                       sizeof(session->buffer) - session->buffersize,
-                       fmt, tm);
-        }
-        else
-        {
-          session->buffersize +=
-              sprintf(session->buffer + session->buffersize, "Jan 1 1970 ");
-        }
-
         if(session->buffersize + len + 2 > sizeof(session->buffer))
         {
           /* buffer will overflow */
@@ -2226,9 +2185,9 @@ ftp_xfer_dir(ftp_session_t   *session,
         /* get the base name */
         base = strrchr(args, '/') + 1;
 
-        /* encode \n in path */
+        /* escape \r as per telnet standard */
         len = strlen(base);
-        buffer = encode_path(base, &len, false);
+        buffer = escape_buffer(base, &len, false);
         if(buffer != NULL)
         {
           /* copy to the session buffer to send */
@@ -2508,12 +2467,8 @@ FTP_DECLARE(FEAT)
 
   ftp_session_set_state(session, COMMAND_STATE, 0);
 
-  /* list our features */
-  return ftp_send_response(session, -211, "\r\n"
-                                          " MDTM\r\n"
-                                          " UTF8\r\n"
-                                          "\r\n"
-                                          "211 End\r\n");
+  /* our only feature is UTF-8 */
+  return ftp_send_response(session, -211, "\r\n UTF8\r\n211 End\r\n");
 }
 
 /*! @fn static int HELP(ftp_session_t *session, const char *args)
@@ -2534,9 +2489,9 @@ FTP_DECLARE(HELP)
   /* list our accepted commands */
   return ftp_send_response(session, -214,
       "The following commands are recognized\r\n"
-      " ABOR ALLO APPE CDUP CWD DELE FEAT HELP LIST MDTM MKD MODE NLST NOOP\r\n"
-      " OPTS PASS PASV PORT PWD QUIT REST RETR RMD RNFR RNTO STAT STOR STOU\r\n"
-      " STRU SYST TYPE USER XCUP XCWD XMKD XPWD XRMD\r\n"
+      " ABOR ALLO APPE CDUP CWD DELE FEAT HELP LIST MKD MODE NLST NOOP OPTS\r\n"
+      " PASS PASV PORT PWD QUIT REST RETR RMD RNFR RNTO STAT STOR STOU STRU\r\n"
+      " SYST TYPE USER XCUP XCWD XMKD XPWD XRMD\r\n"
       "214 End\r\n");
 }
 
@@ -2559,46 +2514,6 @@ FTP_DECLARE(LIST)
   return ftp_xfer_dir(session, args, XFER_DIR_LIST);
 }
 
-/*! @fn static int MDTM(ftp_session_t *session, const char *args)
- *
- *  @brief get last modification time
- *
- *  @param[in] session ftp session
- *  @param[in] args    arguments
- *
- *  @returns error
- */
-FTP_DECLARE(MDTM)
-{
-  int       rc;
-  uint64_t  mtime;
-  time_t    t_mtime;
-  struct tm *tm;
-
-  console_print(CYAN "%s %s\n" RESET, __func__, args ? args : "");
-
-  ftp_session_set_state(session, COMMAND_STATE, 0);
-
-  /* build the path */
-  if(build_path(session, session->cwd, args) != 0)
-    return ftp_send_response(session, 553, "%s\r\n", strerror(errno));
-
-  rc = sdmc_getmtime(session->buffer, &mtime);
-  if(rc != 0)
-    return ftp_send_response(session, 550, "Error getting mtime\r\n");
-
-  t_mtime = mtime;
-  tm = gmtime(&t_mtime);
-  if(tm == NULL)
-    return ftp_send_response(session, 550, "Error getting mtime\r\n");
-
-  session->buffersize = strftime(session->buffer, sizeof(session->buffer), "%Y%m%d%H%M%S", tm);
-  if(session->buffersize == 0)
-    return ftp_send_response(session, 550, "Error getting mtime\r\n");
-  session->buffer[session->buffersize] = 0;
-
-  return ftp_send_response(session, 213, "%s\r\n", session->buffer);
-}
 /*! @fn static int MKD(ftp_session_t *session, const char *args)
  *
  *  @brief create a directory
@@ -2963,12 +2878,12 @@ FTP_DECLARE(PWD)
 
   ftp_session_set_state(session, COMMAND_STATE, 0);
 
-  /* encode the cwd */
+  /* escape the cwd */
   len = strlen(session->cwd);
-  path = encode_path(session->cwd, &len, true);
+  path = escape_buffer(session->cwd, &len, true);
   if(path != NULL)
   {
-    i = sprintf(buffer, "257 \"");
+    i = sprintf(buffer, "256 \"");
     if(i + len + 3 > sizeof(buffer))
     {
       /* buffer will overflow */
