@@ -34,7 +34,7 @@ INCLUDES	:=	include
 
 VERSION	:=	v1.0
 
-APP_TITLE	:= 	ftbrony v2.2
+APP_TITLE	:= 	ftbrony v2.2 netfreak mod
 APP_DESCRIPTION	:=	minimal ftp server
 APP_AUTHOR	:=	mtheall
 

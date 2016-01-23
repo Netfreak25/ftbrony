@@ -8,11 +8,11 @@ Modifications from original
 ---------------------------
 - Ponys have been removed/replaced
 - Building also cia now
+- Removed Linux Makefile
 
 Features
 --------
 - Appears to work well with a variety of clients.
-- Also compiles for Linux.
 - Supports multiple simultaneous clients. The 3DS itself only appears to support enough sockets to perform 4-5 simultaneous data transfers, so it will help if you limit your FTP client to this many parallel requests.
 - Cutting-edge graphics.
 
@@ -25,6 +25,7 @@ Clone this repository and cd in the resulting directory.
     make
 
 Copy the `ftbrony.3dsx` file to your SD card and launch it.
+Copy the `ftbrony.cia` file to you SD card and install it with e.g. FBI, DevMenu or NASA
 
 Supported Commands
 ------------------
@@ -38,7 +39,6 @@ Supported Commands
 - FEAT
 - HELP
 - LIST
-- MDTM
 - MKD
 - MODE (no-op)
 - NLST
