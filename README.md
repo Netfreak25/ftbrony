@@ -24,6 +24,8 @@ Clone this repository and cd in the resulting directory.
 
     make
 
+If you don't want to compile yourself, prebuild version can be found [here](https://github.com/Netfreak25/ftbrony/releases).
+
 Copy the `ftbrony.3dsx` file to your SD card and launch it.
 Copy the `ftbrony.cia` file to you SD card and install it with e.g. FBI, DevMenu or NASA
 
